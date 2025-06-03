@@ -28,6 +28,9 @@ Returns:
 from typing import List, Dict, Any
 import httpx
 import asyncio
+import base64
+import quopri
+from bs4 import BeautifulSoup
 
 GMAIL_FIELDS = [
     "messageId",
@@ -93,24 +96,73 @@ def extract_essential_fields(message: Dict[str, Any]) -> Dict[str, Any]:
         "messageText": message_text,
     }
 
+# Helper function for decoding email body data
+def _decode_part_data(data_string: str) -> str:
+    """Decodes base64url encoded string, with fallback for quopri and utf-8 errors."""
+    if not data_string:
+        return ""
+    
+    # Add correct padding for base64url
+    padding = '=' * (-len(data_string) % 4)
+    try:
+        decoded_bytes = base64.urlsafe_b64decode(data_string + padding)
+    except Exception: # Catch base64 decoding errors
+        # If base64 decoding itself fails, return empty or log an error
+        return ""
+
+    try:
+        # Try decoding as UTF-8 first
+        return decoded_bytes.decode('utf-8')
+    except UnicodeDecodeError:
+        # If UTF-8 fails, try quoted-printable, then decode its result as UTF-8
+        try:
+            # quopri.decodestring expects bytes
+            quopri_decoded_bytes = quopri.decodestring(decoded_bytes)
+            return quopri_decoded_bytes.decode('utf-8', errors='replace')
+        except Exception:
+            # If quopri or its subsequent decode fails, fallback to decoding original bytes with 'replace'
+            return decoded_bytes.decode('utf-8', errors='replace')
+    except Exception:
+        # Catch any other unforeseen errors during decoding attempts
+        return ""
+
 def extract_message_text(payload: Dict[str, Any]) -> str:
     """
-    Extract plain text from the message payload.
+    Extracts and concatenates all plain text content from the message payload parts.
+    Prioritizes text/plain parts using a depth-first traversal.
     """
-    if payload.get("body", {}).get("data"):
-        import base64
-        import quopri
-        data = payload["body"]["data"]
-        try:
-            decoded_bytes = base64.urlsafe_b64decode(data + '==')
-            try:
-                return decoded_bytes.decode("utf-8")
-            except UnicodeDecodeError:
-                return quopri.decodestring(decoded_bytes).decode("utf-8", errors="replace")
-        except Exception:
-            return ""
-    # If multipart, recursively search for text/plain
-    for part in payload.get("parts", []):
-        if part.get("mimeType") == "text/plain":
-            return extract_message_text(part)
-    return "" 
+    collected_texts = []
+    parts_to_visit = [payload]  # Start with the main payload
+
+    while parts_to_visit:
+        current_part = parts_to_visit.pop() # Depth-First Search
+        mime_type = current_part.get("mimeType", "")
+
+        if mime_type == "text/plain":
+            body = current_part.get("body", {})
+            data = body.get("data")
+            if data:
+                decoded_text = _decode_part_data(data)
+                if decoded_text:
+                    collected_texts.append(decoded_text)
+        elif mime_type == "text/html":
+            body = current_part.get("body", {})
+            data = body.get("data")
+            if data:
+                decoded_html = _decode_part_data(data)
+                if decoded_html:
+                    soup = BeautifulSoup(decoded_html, "html.parser")
+                    extracted_text = soup.get_text(separator="\n", strip=True)
+                    if extracted_text:
+                        collected_texts.append(extracted_text)
+        
+        # If the current part is multipart, add its sub-parts to the stack for further processing.
+        # Add them in reversed order so that pop() processes them in their original order (maintaining DFS behavior).
+        if mime_type.startswith("multipart/"):
+            sub_parts = current_part.get("parts", [])
+            for sub_part in reversed(sub_parts): # Add children to stack
+                parts_to_visit.append(sub_part)
+                
+    # The order of collected_texts might be reversed from the visual order in complex emails
+    # depending on DFS traversal. Reversing here attempts to restore a more natural top-to-bottom flow.
+    return "\n".join(reversed(collected_texts)).strip() 
