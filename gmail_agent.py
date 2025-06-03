@@ -129,40 +129,45 @@ def _decode_part_data(data_string: str) -> str:
 def extract_message_text(payload: Dict[str, Any]) -> str:
     """
     Extracts and concatenates all plain text content from the message payload parts.
-    Prioritizes text/plain parts using a depth-first traversal.
+    Prioritizes text/plain and text/html parts using a depth-first traversal.
     """
-    collected_texts = []
-    parts_to_visit = [payload]  # Start with the main payload
+    collected_texts: List[str] = []
+    parts_to_visit: List[Dict[str, Any]] = [payload]  # Start with the main payload
 
     while parts_to_visit:
         current_part = parts_to_visit.pop() # Depth-First Search
-        mime_type = current_part.get("mimeType", "")
+        
+        mime_type = current_part.get("mimeType", "").lower()
+        body_data = current_part.get("body", {}).get("data")
+        sub_parts = current_part.get("parts")
 
-        if mime_type == "text/plain":
-            body = current_part.get("body", {})
-            data = body.get("data")
-            if data:
-                decoded_text = _decode_part_data(data)
+        if body_data:
+            if mime_type == "text/plain":
+                decoded_text = _decode_part_data(body_data)
                 if decoded_text:
                     collected_texts.append(decoded_text)
-        elif mime_type == "text/html":
-            body = current_part.get("body", {})
-            data = body.get("data")
-            if data:
-                decoded_html = _decode_part_data(data)
+            elif mime_type == "text/html":
+                decoded_html = _decode_part_data(body_data)
                 if decoded_html:
                     soup = BeautifulSoup(decoded_html, "html.parser")
-                    extracted_text = soup.get_text(separator="\n", strip=True)
+                    extracted_text = soup.get_text(separator="\\n", strip=True)
                     if extracted_text:
                         collected_texts.append(extracted_text)
+            # Fallback for body_data if not already processed as text/plain or text/html,
+            # and it's not a multipart container itself and has no sub_parts (indicating it's a leaf with data).
+            elif not sub_parts and not mime_type.startswith("multipart/"):
+                decoded_text = _decode_part_data(body_data)
+                if decoded_text:
+                    collected_texts.append(decoded_text)
         
-        # If the current part is multipart, add its sub-parts to the stack for further processing.
-        # Add them in reversed order so that pop() processes them in their original order (maintaining DFS behavior).
-        if mime_type.startswith("multipart/"):
-            sub_parts = current_part.get("parts", [])
-            for sub_part in reversed(sub_parts): # Add children to stack
+        # If there are sub-parts, add them for processing.
+        # This ensures that parts of a message are processed even if the parent part 
+        # doesn't have a 'multipart/*' mimeType but does contain a 'parts' array.
+        if sub_parts:
+            # Add them in reversed order so that pop() processes them in their original order (maintaining DFS behavior).
+            for sub_part in reversed(sub_parts):
                 parts_to_visit.append(sub_part)
                 
     # The order of collected_texts might be reversed from the visual order in complex emails
     # depending on DFS traversal. Reversing here attempts to restore a more natural top-to-bottom flow.
-    return "\n".join(reversed(collected_texts)).strip() 
+    return "\\n".join(reversed(collected_texts)).strip() 
